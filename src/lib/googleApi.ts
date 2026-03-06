@@ -41,9 +41,67 @@ async function api<T>(
 
 const FLOGGER_SHEET_NAME = 'Flogger'
 const SPREADSHEET_MIME = 'application/vnd.google-apps.spreadsheet'
+const APP_CONFIG_FILENAME = 'flogger-config.json'
 
-/** Find an existing Flogger spreadsheet in the user's Drive. Returns id if found, else null. */
-export async function findFloggerSpreadsheet(accessToken: string): Promise<string | null> {
+interface AppConfig {
+  spreadsheetId: string
+}
+
+/**
+ * Read the Flogger config from appDataFolder. This folder is shared across all
+ * OAuth sessions for the same Google account + OAuth client ID, making it a
+ * true single source of truth regardless of browser, device, or incognito mode.
+ */
+async function readAppConfig(accessToken: string): Promise<{ fileId: string; config: AppConfig } | null> {
+  const q = `name='${APP_CONFIG_FILENAME}' and 'appDataFolder' in parents and trashed=false`
+  const params = new URLSearchParams({ q, spaces: 'appDataFolder', fields: 'files(id)', pageSize: '1', orderBy: 'createdTime' })
+  const result = await api<{ files?: { id: string }[] }>(
+    accessToken,
+    `https://www.googleapis.com/drive/v3/files?${params}`
+  )
+  const file = result.files?.[0]
+  if (!file) return null
+  const config = await api<AppConfig>(
+    accessToken,
+    `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`
+  )
+  return { fileId: file.id, config }
+}
+
+/** Write the Flogger config to appDataFolder, creating or updating the file. */
+async function writeAppConfig(accessToken: string, config: AppConfig, existingFileId?: string): Promise<void> {
+  const body = JSON.stringify(config)
+  if (existingFileId) {
+    await api<unknown>(
+      accessToken,
+      `https://www.googleapis.com/upload/drive/v3/files/${existingFileId}?uploadType=media`,
+      { method: 'PATCH', body }
+    )
+  } else {
+    const file = await api<{ id: string }>(accessToken, 'https://www.googleapis.com/drive/v3/files', {
+      method: 'POST',
+      body: JSON.stringify({ name: APP_CONFIG_FILENAME, parents: ['appDataFolder'], mimeType: 'application/json' }),
+    })
+    await api<unknown>(
+      accessToken,
+      `https://www.googleapis.com/upload/drive/v3/files/${file.id}?uploadType=media`,
+      { method: 'PATCH', body }
+    )
+  }
+}
+
+/** Verify that a spreadsheet ID is still accessible (e.g. not deleted by the user). */
+async function spreadsheetExists(accessToken: string, spreadsheetId: string): Promise<boolean> {
+  try {
+    await api<unknown>(accessToken, `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=spreadsheetId`)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Find an existing Flogger spreadsheet in the user's Drive by name. Migration fallback only. */
+async function findFloggerSpreadsheet(accessToken: string): Promise<string | null> {
   const q = [
     `name='${FLOGGER_SHEET_NAME}'`,
     `mimeType='${SPREADSHEET_MIME}'`,
@@ -58,11 +116,33 @@ export async function findFloggerSpreadsheet(accessToken: string): Promise<strin
   return file?.id ?? null
 }
 
-/** Use existing Flogger sheet in Drive if present, otherwise create one. Single source of truth per Google account. */
+/**
+ * Resolve the spreadsheet ID to use for this session.
+ *
+ * Priority:
+ *   1. appDataFolder config – shared across all devices/browsers for the same
+ *      Google account, so every instance converges on the same sheet instantly.
+ *   2. Drive name search – migration path for users who had a sheet before
+ *      appDataFolder was introduced.
+ *   3. Create a new spreadsheet.
+ *
+ * After resolving via (2) or (3), the ID is written back to appDataFolder so
+ * that all subsequent sign-ins (on any device) skip straight to step 1.
+ */
 export async function findOrCreateSpreadsheet(accessToken: string): Promise<string> {
+  const stored = await readAppConfig(accessToken)
+  if (stored) {
+    const exists = await spreadsheetExists(accessToken, stored.config.spreadsheetId)
+    if (exists) return stored.config.spreadsheetId
+    // Sheet was deleted; fall through to find or create a replacement
+  }
+
   const existing = await findFloggerSpreadsheet(accessToken)
-  if (existing) return existing
-  return createSpreadsheet(accessToken)
+  const spreadsheetId = existing ?? await createSpreadsheet(accessToken)
+
+  await writeAppConfig(accessToken, { spreadsheetId }, stored?.fileId)
+
+  return spreadsheetId
 }
 
 /** Create a new spreadsheet in the user's Drive and set headers. Returns spreadsheet ID. */

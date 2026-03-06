@@ -44,7 +44,8 @@ const SCOPES = [
   'https://www.googleapis.com/auth/userinfo.email',
   'https://www.googleapis.com/auth/spreadsheets',
   'https://www.googleapis.com/auth/drive.file',
-  'https://www.googleapis.com/auth/drive.metadata.readonly', // find existing Flogger sheet across devices
+  'https://www.googleapis.com/auth/drive.appdata', // shared config across all devices/instances
+  'https://www.googleapis.com/auth/drive.metadata.readonly', // migration: find pre-existing Flogger sheet by name
 ].join(' ')
 
 function decodeJwtPayload(token: string): { email?: string } {
